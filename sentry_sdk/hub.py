@@ -11,10 +11,11 @@ from sentry_sdk.client import Client
 from sentry_sdk.tracing import Span
 from sentry_sdk.sessions import Session
 from sentry_sdk.utils import (
-    exc_info_from_error,
-    event_from_exception,
-    logger,
     ContextVar,
+    event_from_exception,
+    exc_info_from_error,
+    json_dumps,
+    logger,
 )
 
 from sentry_sdk._types import MYPY
