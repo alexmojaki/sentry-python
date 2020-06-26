@@ -12,6 +12,7 @@ if MYPY:
     from typing import Optional
     from typing import Tuple
     from typing import Type
+    from typing import Union
     from typing_extensions import Literal
 
     ExcInfo = Tuple[
@@ -36,3 +37,7 @@ if MYPY:
     ]
     SessionStatus = Literal["ok", "exited", "crashed", "abnormal"]
     EndpointType = Literal["store", "envelope"]
+
+    from sentry_sdk.tracing import Span, Transaction  # noqa
+
+    SpanLike = Union[Span, Transaction]

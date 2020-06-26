@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from sentry_sdk._compat import with_metaclass
 from sentry_sdk.scope import Scope
 from sentry_sdk.client import Client
-from sentry_sdk.tracing import Span
+from sentry_sdk.tracing import Span, Transaction
 from sentry_sdk.sessions import Session
 from sentry_sdk.utils import (
     exc_info_from_error,
@@ -441,38 +441,138 @@ class Hub(with_metaclass(HubMeta)):  # type: ignore
     ):
         # type: (...) -> Span
         """
-        Create a new span whose parent span is the currently active
-        span, if any. The return value is the span object that can
-        be used as a context manager to start and stop timing.
+        Create and start timing a new span whose parent is the currently active
+        span or transaction, if any. The return value is a span instance,
+        typically used as a context manager to start and stop timing in a `with`
+        block.
 
-        Note that you will not see any span that is not contained
-        within a transaction. Create a transaction with
-        ``start_span(transaction="my transaction")`` if an
-        integration doesn't already do this for you.
+        Only spans contained in a transaction are sent to Sentry. Most
+        integrations start a transaction at the appropriate time, for example
+        for every incoming HTTP request. Use `start_transaction` to start a new
+        transaction when one is not already in progress.
         """
+        # XXX: if the only way to use start_span correctly is when there
+        # is already an existing transaction/span in the scope, then
+        # this is a hard to use API. We don't document nor support
+        # appending an existing span to a new transaction created to
+        # contain the span.
 
-        client, scope = self._stack[-1]
+        # TODO: consider removing this in a future release.
+        # This is for backwards compatibility with releases before
+        # start_transaction existed, to allow for a smoother transition.
+        if isinstance(span, Transaction) or "transaction" in kwargs:
+            deprecation_msg = (
+                "Deprecated: use start_transaction to start transactions and "
+                "Transaction.start_child to start spans."
+            )
+            if isinstance(span, Transaction):
+                logger.warning(deprecation_msg)
+                return self.start_transaction(span)
+            if "transaction" in kwargs:
+                logger.warning(deprecation_msg)
+                name = kwargs.pop("transaction")
+                return self.start_transaction(name=name, **kwargs)
+
+        # XXX: this is not very useful because
+        #
+        #     with hub.start_span(Span(...)):
+        #         pass
+        #
+        # is equivalent to the simpler
+        #
+        #     with Span(...):
+        #         pass
+        if span is not None:
+            return span
 
         kwargs.setdefault("hub", self)
 
-        if span is None:
-            span = scope.span
-            if span is not None:
-                span = span.new_span(**kwargs)
-            else:
-                span = Span(**kwargs)
+        span = self.scope.span
+        if span is not None:
+            return span.start_child(**kwargs)
 
-        if span.sampled is None and span.transaction is not None:
+        # XXX: returning a detached span here means whatever span tree built
+        # from it will be eventually discarded.
+        #
+        # This is also not very useful because
+        #
+        #     with hub.start_span(op="..."):
+        #         pass
+        #
+        # is equivalent, when there is no span in the scope, to the simpler
+        #
+        #     with Span(op="..."):
+        #         pass
+        return Span(**kwargs)
+
+    def start_transaction(
+        self,
+        transaction=None,  # type: Optional[Transaction]
+        **kwargs  # type: Any
+    ):
+        # type: (...) -> Transaction
+        """
+        Start and return a transaction.
+
+        Start an existing transaction if given, otherwise create and start a new
+        transaction with kwargs.
+
+        This is the entry point to manual tracing instrumentation.
+
+        A tree structure can be built by adding child spans to the transaction,
+        and child spans to other spans. To start a new child span within the
+        transaction or any span, call the respective `.start_child()` method.
+
+        Every child span must be finished before the transaction is finished,
+        otherwise the unfinished spans are discarded.
+
+        When used as context managers, spans and transactions are automatically
+        finished at the end of the `with` block. If not using context managers,
+        call the `.finish()` method.
+
+        When the transaction is finished, it will be sent to Sentry with all its
+        finished child spans.
+        """
+        # XXX: should we always set transaction.hub = self?
+        # In a multi-hub program, what does it mean to write
+        #     hub1.start_transaction(Transaction(hub=hub2))
+        # ? Should the transaction be on hub1 or hub2?
+
+        # XXX: it is strange that both start_span and start_transaction take
+        # kwargs, but those are ignored if span/transaction are not None.
+        # Code such as:
+        #     hub.start_transaction(Transaction(name="foo"), name="bar")
+        #
+        # is clearly weird, but not so weird if we intentionally want to rename
+        # a transaction we got from somewhere else:
+        #     hub.start_transaction(transaction, name="new_name")
+        #
+        # Would be clearer if Hub was not involved:
+        #     transaction.name = "new_name"
+        #     with transaction:  # __enter__ => start, __exit__ => finish
+        #         with transaction.start_child(...):
+        #             pass
+        #         # alternatively, rely on transaction being in the current scope
+        #         with Span(...):
+        #             pass
+
+        if transaction is None:
+            kwargs.setdefault("hub", self)
+            transaction = Transaction(**kwargs)
+
+        client, scope = self._stack[-1]
+
+        if transaction.sampled is None:
             sample_rate = client and client.options["traces_sample_rate"] or 0
-            span.sampled = random.random() < sample_rate
+            transaction.sampled = random.random() < sample_rate
 
-        if span.sampled:
+        if transaction.sampled:
             max_spans = (
                 client and client.options["_experiments"].get("max_spans") or 1000
             )
-            span.init_finished_spans(maxlen=max_spans)
+            transaction.init_span_recorder(maxlen=max_spans)
 
-        return span
+        return transaction
 
     @overload  # noqa
     def push_scope(
